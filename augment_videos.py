@@ -64,6 +64,7 @@ import re
 import shutil
 import subprocess
 import sys
+import textwrap
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
@@ -144,6 +145,16 @@ CAPTION_FONT_SCALE_RANGE = (0.038, 0.062)  # доля высоты кадра
 CAPTION_MARGIN_RANGE = (0.04, 0.11)        # доля высоты кадра
 CAPTION_BORDER_RANGE = (1, 3)
 CAPTION_MAX_CHARS = 120
+# drawtext не переносит текст сам. Ширину строки считаем из ширины кадра:
+# 0.86 — безопасная зона по горизонтали, 0.58 — средняя ширина глифа в
+# долях кегля.
+CAPTION_SAFE_WIDTH = 0.86
+CAPTION_GLYPH_RATIO = 0.58
+CAPTION_MIN_CHARS_PER_LINE = 12
+
+DEFAULT_PRESET = "medium"
+# h264_nvenc на строгих сборках FFmpeg не принимает пресеты libx264.
+NVENC_DEFAULT_PRESET = "p4"
 
 
 # --- Структуры данных --------------------------------------------------------
@@ -176,8 +187,9 @@ class MetadataProfile:
 
 @dataclass
 class CaptionParams:
-    text: str
+    text: str             # уже разбитый на строки (textwrap)
     fontsize: int
+    max_chars_per_line: int
     position: str         # "top" | "bottom"
     margin: int           # пикселей от края
     borderw: int
@@ -343,11 +355,19 @@ def sample_caption(rng: random.Random, info: VideoInfo,
                    captions: List[str]) -> Optional[CaptionParams]:
     if not captions:
         return None
-    height = even(info.height)
+    width, height = even(info.width), even(info.height)
     text = rng.choice(captions)[:CAPTION_MAX_CHARS]
+    fontsize = max(10, int(round(height * rng.uniform(*CAPTION_FONT_SCALE_RANGE))))
+    # Длинная строка иначе уезжает за границы кадра (особенно вертикального),
+    # поэтому раскладываем её на несколько строк заранее.
+    max_chars_per_line = max(
+        CAPTION_MIN_CHARS_PER_LINE,
+        int((width * CAPTION_SAFE_WIDTH) / (fontsize * CAPTION_GLYPH_RATIO)),
+    )
     return CaptionParams(
-        text=text,
-        fontsize=max(10, int(round(height * rng.uniform(*CAPTION_FONT_SCALE_RANGE)))),
+        text=textwrap.fill(text, width=max_chars_per_line),
+        fontsize=fontsize,
+        max_chars_per_line=max_chars_per_line,
         position=rng.choice(("top", "bottom")),
         margin=max(4, int(round(height * rng.uniform(*CAPTION_MARGIN_RANGE)))),
         borderw=rng.randint(*CAPTION_BORDER_RANGE),
@@ -489,7 +509,8 @@ def build_video_filter(info: VideoInfo, p: AugmentParams,
     # crop пересчитывает x/y на каждом кадре, поэтому окно всегда по центру.
     zoom = (f"scale=w='trunc(iw*{zexpr}/2)*2':h='trunc(ih*{zexpr}/2)*2'"
             f":eval=frame:flags=bicubic")
-    crop = f"crop={out_w}:{out_h}:exact=1"
+    crop = (f"crop={out_w}:{out_h}:x='(in_w-out_w)/2':y='(in_h-out_h)/2'"
+            f":exact=1")
 
     color = (f"eq=contrast={p.contrast:.4f}:gamma={p.gamma:.4f}"
              f":saturation={p.saturation:.4f},"
@@ -529,6 +550,20 @@ def build_video_filter(info: VideoInfo, p: AugmentParams,
     ])
 
 
+def escape_font_path(path: str) -> str:
+    """
+    Готовит путь к шрифту для опции fontfile в -filter_complex.
+
+    Windows-путь вида C:/Windows/Fonts/arialbd.ttf парсер опций фильтра
+    обрезает по двоеточию после буквы диска, причём FFmpeg на этом не
+    падает, а молча подставляет другой шрифт. Кавычки не помогают —
+    внутри них экранирование не разбирается, — поэтому путь
+    подставляется без кавычек, а ':' и кавычка экранируются.
+    """
+    normalized = path.replace("\\", "/")
+    return normalized.replace("'", "\\\\\\'").replace(":", "\\\\:")
+
+
 def build_caption_filter(caption: Optional[CaptionParams],
                          font: Optional[str]) -> str:
     if caption is None:
@@ -540,7 +575,7 @@ def build_caption_filter(caption: Optional[CaptionParams],
     else:
         y_expr = f"h-text_h-{caption.margin}"
     return (
-        f"drawtext=fontfile='{font}'"
+        f"drawtext=fontfile={escape_font_path(font)}"
         f":text={escape_filter_text(caption.text)}"
         f":expansion=none"
         f":fontsize={caption.fontsize}"
@@ -709,7 +744,9 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=None, help="seed для воспроизводимости")
     ap.add_argument("--crf", type=int, default=18,
                     help="базовое качество x264 (к нему добавляется ±1)")
-    ap.add_argument("--preset", default="medium", help="пресет кодировщика")
+    ap.add_argument("--preset", default=DEFAULT_PRESET,
+                    help=f"пресет кодировщика (по умолчанию {DEFAULT_PRESET}, "
+                         f"с --nvenc — {NVENC_DEFAULT_PRESET})")
     ap.add_argument("--nvenc", action="store_true",
                     help="кодировать через h264_nvenc (GPU) вместо libx264")
     ap.add_argument("--frame-style", choices=("off", "on", "random"), default="random",
@@ -742,7 +779,12 @@ def main() -> int:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     rng = random.Random(args.seed)
-    opts = RenderOptions(preset=args.preset, nvenc=args.nvenc, font=font)
+    preset = args.preset
+    if args.nvenc and preset == DEFAULT_PRESET:
+        # Пресет не задавали явно: подставляем безопасный для h264_nvenc.
+        preset = NVENC_DEFAULT_PRESET
+        print(f"--nvenc: пресет по умолчанию заменён на {preset}", file=sys.stderr)
+    opts = RenderOptions(preset=preset, nvenc=args.nvenc, font=font)
 
     # Параметры генерируются заранее в одном потоке: при фиксированном seed
     # результат не зависит от порядка выполнения задач. Каждый исходник
